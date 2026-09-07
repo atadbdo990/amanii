@@ -1,22 +1,48 @@
+cat > install.sh <<'AMANI_EOF'
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════
 #  Amani — Xray on Google Cloud Run
 #  @amona_mora
 #
 #  No external server. No telemetry. No phoning home.
-#  The only outbound call is api.telegram.org — and only if you
-#  explicitly choose it at the prompt.
+#  The only outbound call is api.telegram.org — to YOUR bot,
+#  YOUR chat, and only if YOU configured it.
+#
+#  Credentials are NEVER stored in this file or in amani.conf.
+#  They come from the environment or from amani.secrets (gitignored).
 # ══════════════════════════════════════════════════════════════
 set -euo pipefail
 umask 077
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── Capture credentials passed on the command line FIRST ───────
+_CLI_TOKEN="${BOT_TOKEN:-}"
+_CLI_CHAT="${CHAT_ID:-}"
+
+# ── Identity ───────────────────────────────────────────────────
 if [[ -f "$HERE/amani.conf" ]]; then
   # shellcheck source=amani.conf
   source "$HERE/amani.conf"
 fi
 
-# ── Defaults if the conf file is missing ───────────────────────
+# ── Local secrets (gitignored) ─────────────────────────────────
+SECRETS_FILE="${AMANI_SECRETS:-$HERE/amani.secrets}"
+if [[ -f "$SECRETS_FILE" ]]; then
+  _perms="$(stat -c '%a' "$SECRETS_FILE" 2>/dev/null || stat -f '%Lp' "$SECRETS_FILE" 2>/dev/null || echo '')"
+  if [[ -n "$_perms" && "$_perms" != "600" && "$_perms" != "400" ]]; then
+    echo -e "\033[1;33m⚠\033[0m  $SECRETS_FILE is $_perms — run: chmod 600 $SECRETS_FILE" >&2
+  fi
+  # shellcheck source=/dev/null
+  source "$SECRETS_FILE"
+fi
+
+# Command line wins over the file.
+BOT_TOKEN="${_CLI_TOKEN:-${BOT_TOKEN:-}}"
+CHAT_ID="${_CLI_CHAT:-${CHAT_ID:-}}"
+unset _CLI_TOKEN _CLI_CHAT _perms
+
+# ── Defaults if amani.conf is missing ──────────────────────────
 : "${BRAND_NAME:=Amani}"
 : "${BRAND_HANDLE:=@amona_mora}"
 : "${BRAND_CHANNEL:=https://t.me/amona_mora}"
@@ -30,7 +56,7 @@ fi
 : "${MIN_INSTANCES:=0}"
 : "${MAX_INSTANCES:=1}"
 : "${CONCURRENCY:=80}"
-: "${TIMEOUT:=900}"
+: "${TIMEOUT:=3600}"
 : "${XRAY_VERSION:=25.3.6}"
 : "${PASSWORD:=}"
 
@@ -60,26 +86,60 @@ rand_hex(){
 }
 
 # ── Cleanup: removes ONLY the mktemp dir we created ─────────────
-#    (The original ran rm -rf on the folder it was launched from.)
 WORKDIR=""
 cleanup(){
-  [[ -n "$WORKDIR" && -d "$WORKDIR" ]] && rm -rf -- "$WORKDIR"
+  if [[ -n "$WORKDIR" && -d "$WORKDIR" ]]; then
+    rm -rf -- "$WORKDIR"
+  fi
+  return 0
 }
 trap cleanup EXIT
 
 require(){ command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
 
-usage(){
-  cat <<EOF
-${BRAND_NAME} ${BRAND_HANDLE} — usage
+# ══════════════════════════════════════════════════════════════
+#  Telegram — sends to YOUR bot / YOUR chat only
+# ══════════════════════════════════════════════════════════════
+telegram_ready(){
+  [[ -n "${BOT_TOKEN:-}" && -n "${CHAT_ID:-}" ]]
+}
 
-  ./install.sh                       Deploy (stealth mode)
-  MODE=brand ./install.sh            Deploy with visible /amani path
-  PROTO=trojan ./install.sh          Choose protocol
-  ./install.sh list                  List your Cloud Run services
-  ./install.sh delete <svc> <reg>    Tear down a service (stops billing)
-  ./install.sh help                  This screen
-EOF
+telegram_validate(){
+  [[ "${BOT_TOKEN}" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]] \
+    || die "Invalid BOT_TOKEN. Expected format: 123456789:ABCdef... (no spaces inside quotes!)"
+  if [[ ! "${CHAT_ID}" =~ ^-?[0-9]+$ && ! "${CHAT_ID}" =~ ^@[A-Za-z][A-Za-z0-9_]{3,31}$ ]]; then
+    die "Invalid CHAT_ID. Use a numeric ID (123456789, -1001234567890) or @channelname"
+  fi
+}
+
+telegram_send(){
+  local text="$1"
+  curl -s --max-time 20 \
+       --data-urlencode "chat_id=${CHAT_ID}" \
+       --data-urlencode "text=${text}" \
+       --data-urlencode "parse_mode=HTML" \
+       --data-urlencode "disable_web_page_preview=true" \
+       "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" >/dev/null
+}
+
+usage(){
+  cat <<'USAGE_EOF'
+Amani — usage
+
+  ./install.sh                          Deploy (stealth mode)
+  BOT_TOKEN=.. CHAT_ID=.. ./install.sh  Deploy + auto-send to your Telegram
+  MODE=brand ./install.sh               Deploy with visible /amani path
+  PROTO=trojan ./install.sh             Choose protocol
+  ./install.sh notify                   Test your Telegram setup only
+  ./install.sh list                     List your Cloud Run services
+  ./install.sh delete <svc> <reg>       Tear down a service (stops billing)
+  ./install.sh help                     This screen
+
+Credential sources (highest precedence first):
+  1. BOT_TOKEN / CHAT_ID environment variables
+  2. ./amani.secrets   (chmod 600, gitignored — NEVER commit this)
+  3. Interactive prompt at the end of a deploy
+USAGE_EOF
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -87,6 +147,18 @@ EOF
 # ══════════════════════════════════════════════════════════════
 case "${1:-deploy}" in
   help|--help|-h) usage; exit 0 ;;
+
+  notify|--notify|test)
+    require curl
+    telegram_ready || die "BOT_TOKEN / CHAT_ID not set. Pass them on the command line or put them in ./amani.secrets"
+    telegram_validate
+    say "Testing Telegram delivery to ${B}${CHAT_ID}${N} ..."
+    if telegram_send "<b>⚡ ${BRAND_NAME}</b> ${D}${BRAND_HANDLE}${N}<i>bot is working ✔</i>"; then
+      ok "Message sent. Your bot + chat ID are valid."
+    else
+      die "Send failed. Check the token and that you have started a chat with the bot."
+    fi
+    exit 0 ;;
 
   list|--list)
     require gcloud
@@ -106,7 +178,7 @@ case "${1:-deploy}" in
     exit 0 ;;
 
   deploy|"") : ;;
-  *) die "Unknown command: $1  (deploy | list | delete | help)" ;;
+  *) die "Unknown command: $1  (deploy | notify | list | delete | help)" ;;
 esac
 
 # ══════════════════════════════════════════════════════════════
@@ -119,12 +191,24 @@ echo -e "   ${D}To stop later: ./install.sh delete <service> <region>${N}"
 echo
 
 INTERACTIVE=false; [[ -t 0 && -t 1 ]] && INTERACTIVE=true
+
 if $INTERACTIVE; then
   read -rp "$(echo -e "${B}Continue? [y/N]: ${N}")" A
   [[ "$A" == [yY]* ]] || die "Cancelled."
+else
+  [[ "${ASSUME_YES:-}" == "yes" ]] \
+    || die "Non-interactive run refused (billing risk). Re-run with ASSUME_YES=yes to confirm."
 fi
 
 require gcloud; require curl
+
+# ── Validate Telegram config early, before we spend 2 minutes building ──
+if telegram_ready; then
+  telegram_validate
+  ok "Telegram configured → link will be sent to ${B}${CHAT_ID}${N}"
+else
+  say "Telegram not configured (set BOT_TOKEN + CHAT_ID to auto-send)."
+fi
 
 PROJECT="$(gcloud config get-value project 2>/dev/null || true)"
 [[ -n "$PROJECT" && "$PROJECT" != "(unset)" ]] || die "Set a project first: gcloud config set project <ID>"
@@ -167,7 +251,7 @@ SERVICE="${SERVICE:-${BRAND_SERVICE_PREFIX}-$(rand_hex 4)}"
 # ── Secret ─────────────────────────────────────────────────────
 if [[ -n "$PASSWORD" ]]; then
   SECRET="$PASSWORD"
-  warn "Pinned credential from amani.conf — ${R}do not distribute the script in this state.${N}"
+  warn "Pinned credential — ${R}do not distribute the script in this state.${N}"
 elif [[ "$PROTO" == "trojan" ]]; then
   SECRET="$(rand_hex 32)"
 else
@@ -188,6 +272,11 @@ printf "  ${B}%-13s${N} %s\n" "Region"    "$REGION"
 printf "  ${B}%-13s${N} %s\n" "Path"      "$WSPATH"
 printf "  ${B}%-13s${N} %s\n" "Mode"      "$MODE"
 printf "  ${B}%-13s${N} %s\n" "Resources" "${MEMORY}MB / ${CPU} cpu / min=${MIN_INSTANCES}"
+if telegram_ready; then
+  printf "  ${B}%-13s${N} %s\n" "Telegram" "${G}on → ${CHAT_ID}${N}"
+else
+  printf "  ${B}%-13s${N} %s\n" "Telegram" "${D}off${N}"
+fi
 echo -e "${M}${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${N}\n"
 
 # ══════════════════════════════════════════════════════════════
@@ -201,17 +290,17 @@ for f in Dockerfile main.go go.mod config.json.tpl; do
 done
 cd "$WORKDIR"
 
-# BSD/GNU-portable in-place edit
 sed "s|__XRAY_VERSION__|${XRAY_VERSION}|g" Dockerfile > Dockerfile.tmp && mv Dockerfile.tmp Dockerfile
 
 # ══════════════════════════════════════════════════════════════
 #  Deploy
+#  NOTE: BOT_TOKEN is deliberately NOT sent to Cloud Run.
+#  The server has no reason to hold your Telegram credentials.
 # ══════════════════════════════════════════════════════════════
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')" \
   || die "Could not read project number — check your permissions."
 HOST="${SERVICE}-${PROJECT_NUMBER}.${REGION}.run.app"
 
-# NOTE: PORT is intentionally omitted — Cloud Run injects $PORT itself.
 ENV_VARS="PROTO=${PROTO},USER_ID=${SECRET},WS_PATH=${WSPATH},NETWORK=ws,HOST=${HOST},INBOUND_TAG=${BRAND_TAG}"
 
 say "Building and deploying to Cloud Run (about 2 minutes) ..."
@@ -255,7 +344,7 @@ echo
 # ── Optional QR code ───────────────────────────────────────────
 if command -v qrencode >/dev/null 2>&1; then
   echo -e "${D}  Scan to connect:${N}"
-  qrencode -t ANSIUTF8 "$LINK" | sed 's/^/    /'
+  qrencode -t ANSIUTF8 "$LINK" | sed 's/^/    /' || warn "qrencode failed — copy the link above manually."
   echo
 fi
 
@@ -264,20 +353,46 @@ echo -e "${Y}${B}⚠ To stop billing:${N} ./install.sh delete ${SERVICE} ${REGIO
 echo
 
 # ══════════════════════════════════════════════════════════════
-#  Telegram — opt-in, announced, sends to YOUR chat only
+#  Deliver to Telegram
+#  • configured  → sends automatically, no prompt
+#  • interactive → offers to configure now
+#  • otherwise   → skipped
 # ══════════════════════════════════════════════════════════════
-if $INTERACTIVE; then
+if ! telegram_ready && $INTERACTIVE; then
   read -rp "$(echo -e "${B}Send the link to Telegram? [y/N]: ${N}")" TG
   if [[ "$TG" == [yY]* ]]; then
     read -rp "Bot Token: " BOT_TOKEN
     read -rp "Chat ID:   " CHAT_ID
-    [[ "$BOT_TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]+$ ]] || die "Invalid bot token."
-    curl -s --data-urlencode "chat_id=${CHAT_ID}" \
-            --data-urlencode "text=${LINK}" \
-         "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" >/dev/null \
-      && ok "Sent to your own Telegram." || warn "Send failed."
+    telegram_validate
+    say "Tip: save these to ./amani.secrets (chmod 600) so you never type them again."
   fi
 fi
 
-echo -e "${D}${BRAND_NAME} ${BRAND_HANDLE} — done.${N}"
+if telegram_ready; then
+  say "Sending to Telegram ..."
+  MSG="<b>⚡ ${BRAND_NAME}</b> — ${D}${BRAND_HANDLE}${N}
 
+<b>Protocol:</b> ${PROTO^^}
+<b>Region:</b> ${REGION}
+<b>Host:</b> <code>${HOST}</code>
+<b>Path:</b> <code>${WSPATH}</code>
+<b>Network:</b> WebSocket + TLS
+
+<code>${LINK}</code>
+
+<i>To stop billing:</i>
+<code>./install.sh delete ${SERVICE} ${REGION}</code>"
+
+  if telegram_send "$MSG"; then
+    ok "Link sent to ${B}${CHAT_ID}${N}"
+  else
+    warn "Telegram send failed. The link above still works — copy it manually."
+  fi
+else
+  say "Telegram skipped (no BOT_TOKEN / CHAT_ID)."
+fi
+
+echo
+echo -e "${D}${BRAND_NAME} ${BRAND_HANDLE} — done.${N}"
+AMANI_EOF
+chmod +x install.sh
