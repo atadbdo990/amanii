@@ -1,17 +1,17 @@
 {
-  "log": {
-    "loglevel": "warning"
-  },
+  "log": { "loglevel": "warning" },
   "inbounds": [
     {
       "port": __PORT__,
       "listen": "0.0.0.0",
+      "tag": "__INBOUND_TAG__",
       "protocol": "__PROTO__",
       "settings": {
         "clients": [
           {
             "id": "__USER_ID__",
             "password": "__USER_ID__",
+            "email": "__INBOUND_TAG__@amani",
             "level": 0
           }
         ],
@@ -20,31 +20,21 @@
       "streamSettings": {
         "network": "__NETWORK__",
         "security": "none",
-        "tcpSettings": {
-          "header": {
-            "type": "none"
-          }
-        },
         "wsSettings": {
           "path": "__WS_PATH__",
           "host": "__HOST__"
-        },
-        "grpcSettings": {
-          "serviceName": "__WS_PATH__"
         }
       },
       "sniffing": {
-        "enabled": false,
-        "destOverride": ["http", "tls"]
+        "enabled": true,
+        "destOverride": ["http", "tls", "quic"]
       }
     },
     {
       "port": 10085,
       "listen": "127.0.0.1",
       "protocol": "dokodemo-door",
-      "settings": {
-        "address": "127.0.0.1"
-      },
+      "settings": { "address": "127.0.0.1" },
       "tag": "api"
     }
   ],
@@ -52,30 +42,17 @@
     {
       "protocol": "freedom",
       "settings": {},
-      "streamSettings": {
-        "sockopt": {
-          "tcpFastOpen": true
-        }
-      },
+      "streamSettings": { "sockopt": { "tcpFastOpen": true } },
       "tag": "direct"
     },
-    {
-      "protocol": "freedom",
-      "tag": "api"
-    }
+    { "protocol": "blackhole", "tag": "block" }
   ],
   "stats": {},
-  "api": {
-    "tag": "api",
-    "services": ["StatsService"]
-  },
+  "api": { "tag": "api", "services": ["StatsService"] },
   "routing": {
     "rules": [
-      {
-        "inboundTag": ["api"],
-        "outboundTag": "api",
-        "type": "field"
-      }
+      { "inboundTag": ["api"], "outboundTag": "api", "type": "field" },
+      { "protocol": ["bittorrent"], "outboundTag": "block", "type": "field" }
     ]
   },
   "policy": {
@@ -88,9 +65,6 @@
         "downlinkCapacity": __SPEED_LIMIT__
       }
     },
-    "system": {
-      "statsInboundUplink": true,
-      "statsInboundDownlink": true
-    }
+    "system": { "statsInboundUplink": true, "statsInboundDownlink": true }
   }
 }
