@@ -1,91 +1,104 @@
 package main
 
+// Amani — config generator + xray supervisor
+// @amona_mora
+
 import (
-	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"os/signal"
+	"regexp"
 	"strings"
 	"syscall"
+	"time"
 )
 
-func getenv(key, def string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
+var safeRe = regexp.MustCompile(`^[A-Za-z0-9_./:@=-]*$`)
+
+func env(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
+}
+
+// Blocks JSON injection via environment variables (present in the original).
+func safe(v, name string) string {
+	if !safeRe.MatchString(v) {
+		log.Fatalf("refusing unsafe %s: %q", name, v)
 	}
 	return v
 }
 
 func main() {
-	// Read template
-	tplPath := "/config.json.tpl"
-	data, err := ioutil.ReadFile(tplPath)
+	tpl, err := os.ReadFile("/config.json.tpl")
 	if err != nil {
-		log.Fatalf("failed to read template %s: %v", tplPath, err)
+		log.Fatalf("read template: %v", err)
 	}
-	s := string(data)
 
-	// Gather envs with defaults
-	proto := getenv("PROTO", "vless")
-	user := getenv("USER_ID", getenv("UUID", "changeme"))
-	wspath := getenv("WS_PATH", "/ws")
-	network := getenv("NETWORK", "ws")
-	port := getenv("PORT", "8080")
-	speedLimit := getenv("SPEED_LIMIT", "0")  // 0 = unlimited
-	host := getenv("HOST", "localhost")  // WebSocket host header
-
-	// replace placeholders
 	repl := map[string]string{
-		"__PROTO__": proto,
-		"__USER_ID__": user,
-		"__WS_PATH__": wspath,
-		"__NETWORK__": network,
-		"__PORT__": port,
-		"__SPEED_LIMIT__": speedLimit,
-		"__HOST__": host,
+		"__PROTO__":       safe(env("PROTO", "vless"), "PROTO"),
+		"__USER_ID__":     safe(env("USER_ID", env("UUID", "")), "USER_ID"),
+		"__WS_PATH__":     safe(env("WS_PATH", "/ws"), "WS_PATH"),
+		"__NETWORK__":     "ws",
+		"__PORT__":        env("PORT", "8080"),
+		"__SPEED_LIMIT__": "0",
+		"__HOST__":        safe(env("HOST", "localhost"), "HOST"),
+		"__INBOUND_TAG__": safe(env("INBOUND_TAG", "amani-in"), "INBOUND_TAG"),
 	}
-	for k,v := range repl {
+	if repl["__USER_ID__"] == "" {
+		log.Fatal("USER_ID is empty — refusing to start with no credential")
+	}
+
+	s := string(tpl)
+	for k, v := range repl {
 		s = strings.ReplaceAll(s, k, v)
 	}
 
-	// write output to a writable location
-	outPath := "/tmp/config.json"
-	if err := ioutil.WriteFile(outPath, []byte(s), 0644); err != nil {
-		log.Fatalf("failed to write config: %v", err)
+	// Atomic write, 0600 (the original used 0644)
+	const out = "/tmp/config.json"
+	if err := os.WriteFile(out+".new", []byte(s), 0600); err != nil {
+		log.Fatalf("write config: %v", err)
+	}
+	if err := os.Rename(out+".new", out); err != nil {
+		log.Fatalf("rename config: %v", err)
 	}
 
-	// Start xray as a child process
-	path, err := exec.LookPath("xray")
-	if err != nil {
-		log.Fatalf("xray binary not found in PATH: %v", err)
-	}
-	args := []string{"run", "-config", outPath}
-	cmd := exec.Command(path, args...)
-	cmd.Env = os.Environ()
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("failed to start xray: %v", err)
-	}
-
-	// Setup signal handler to terminate xray on exit
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	var cur *exec.Cmd
 	go func() {
-		s := <-sigCh
-		log.Printf("received signal %v, shutting down xray", s)
-		if cmd.Process != nil {
-			_ = cmd.Process.Kill()
+		<-stop
+		log.Print("signal received, stopping xray")
+		if cur != nil && cur.Process != nil {
+			_ = cur.Process.Signal(syscall.SIGTERM)
 		}
+		time.Sleep(2 * time.Second)
 		os.Exit(0)
 	}()
 
-	// Wait for xray to exit (blocking)
-	if err := cmd.Wait(); err != nil {
-		log.Printf("xray exited with error: %v", err)
+	bin, err := exec.LookPath("xray")
+	if err != nil {
+		log.Fatalf("xray not in PATH: %v", err)
+	}
+
+	// Supervise + restart (the original leaves the service dead in silence)
+	for {
+		cur = exec.Command(bin, "run", "-config", out)
+		cur.Stdout, cur.Stderr, cur.Stdin = os.Stdout, os.Stderr, os.Stdin
+		start := time.Now()
+		err := cur.Run()
+
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		log.Printf("xray exited (%v), restarting", err)
+		if time.Since(start) < 10*time.Second {
+			time.Sleep(10 * time.Second) // backoff against a crash loop
+		}
 	}
 }
