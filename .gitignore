@@ -1,0 +1,19 @@
+# ── Secrets: never commit these ────────────────────────────────
+amani.secrets
+*.secrets
+.env
+.env.*
+
+# ── Build / runtime artefacts ──────────────────────────────────
+config.json
+region_scan_results.txt
+*.dark
+*.log
+xray-configgen
+configgen
+
+# ── Editors / OS ───────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+*.swp
