@@ -1,1 +1,1 @@
-https://t.me/+JJxEJYbQtUo5M2I0
+t.me/amona_mora
