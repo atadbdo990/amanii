@@ -1,3 +1,5 @@
-module xray-configgen
+cat > go.mod <<'AMANI_EOF'
+module amani
 
-go 1.20
+go 1.22
+AMANI_EOF
