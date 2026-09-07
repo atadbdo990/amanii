@@ -1,4 +1,3 @@
-cat > install.sh <<'AMANI_EOF'
 #!/usr/bin/env bash
 # ══════════════════════════════════════════════════════════════
 #  Amani — Xray on Google Cloud Run
@@ -394,5 +393,3 @@ fi
 
 echo
 echo -e "${D}${BRAND_NAME} ${BRAND_HANDLE} — done.${N}"
-AMANI_EOF
-chmod +x install.sh
